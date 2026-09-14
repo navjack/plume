@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include "plume_render_interface_types.h"
 
@@ -20,13 +21,21 @@ namespace plume {
     };
 
     class CocoaWindow {
-        void* windowHandle;
-        CocoaWindowAttributes cachedAttributes;
-        std::atomic<int> cachedRefreshRate;
-        mutable std::mutex attributesMutex;
+    public:
+        // Updates queued to the main thread capture this state instead of `this`,
+        // so they stay valid if the wrapper is destroyed before they run.
+        struct SharedState {
+            void* windowHandle = nullptr;
+            CocoaWindowAttributes cachedAttributes = {0, 0, 0, 0};
+            std::atomic<int> cachedRefreshRate{0};
+            std::mutex attributesMutex;
+        };
 
-        void updateWindowAttributesInternal(bool forceSync = false);
-        void updateRefreshRateInternal(bool forceSync = false);
+    private:
+        std::shared_ptr<SharedState> state;
+
+        void updateWindowAttributesInternal(bool forceSync = false) const;
+        void updateRefreshRateInternal(bool forceSync = false) const;
     public:
         CocoaWindow(void* window);
         ~CocoaWindow();

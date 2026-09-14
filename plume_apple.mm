@@ -42,7 +42,7 @@ namespace plume {
             }
             IOObjectRelease(entry); // Release the entry if we couldn't get parent
         }
-        
+
         return RenderDeviceVendor::UNKNOWN;
     }
 
@@ -56,24 +56,35 @@ namespace plume {
 
     // MARK: - CocoaWindow
 
+    // Main thread only. Asynchronous callers pass shared state and an NSWindow
+    // captured by the block, never `this`: a swapchain can destroy its wrapper
+    // before a queued update runs.
+    static void updateAttributes(CocoaWindow::SharedState &state, NSWindow *nsWindow) {
+        NSRect contentFrame = [[nsWindow contentView] frame];
+        CGFloat scaleFactor = getScaleFactor(nsWindow);
+
+        std::lock_guard<std::mutex> lock(state.attributesMutex);
+        state.cachedAttributes.x = (int)round(contentFrame.origin.x);
+        state.cachedAttributes.y = (int)round(contentFrame.origin.y);
+        state.cachedAttributes.width = (int)round(contentFrame.size.width * scaleFactor);
+        state.cachedAttributes.height = (int)round(contentFrame.size.height * scaleFactor);
+    }
+
+    static void updateRefreshRate(CocoaWindow::SharedState &state, NSWindow *nsWindow) {
+        NSScreen *screen = [nsWindow screen];
+        if (@available(macOS 12.0, *)) {
+            state.cachedRefreshRate.store((int)[screen maximumFramesPerSecond]);
+        }
+    }
+
     CocoaWindow::CocoaWindow(void* window)
-        : windowHandle(window), cachedRefreshRate(0) {
-        cachedAttributes = {0, 0, 0, 0};
+        : state(std::make_shared<SharedState>()) {
+        state->windowHandle = window;
 
         if ([NSThread isMainThread]) {
-            NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
-            NSRect contentFrame = [[nsWindow contentView] frame];
-            CGFloat scaleFactor = getScaleFactor(nsWindow);
-
-            cachedAttributes.x = (int)round(contentFrame.origin.x);
-            cachedAttributes.y = (int)round(contentFrame.origin.y);
-            cachedAttributes.width = (int)round(contentFrame.size.width * scaleFactor);
-            cachedAttributes.height = (int)round(contentFrame.size.height * scaleFactor);
-
-            NSScreen *screen = [nsWindow screen];
-            if (@available(macOS 12.0, *)) {
-                cachedRefreshRate.store((int)[screen maximumFramesPerSecond]);
-            }
+            NSWindow *nsWindow = (__bridge NSWindow *)window;
+            updateAttributes(*state, nsWindow);
+            updateRefreshRate(*state, nsWindow);
         } else {
             updateWindowAttributesInternal(true);
             updateRefreshRateInternal(true);
@@ -82,17 +93,11 @@ namespace plume {
 
     CocoaWindow::~CocoaWindow() {}
 
-    void CocoaWindow::updateWindowAttributesInternal(bool forceSync) {
+    void CocoaWindow::updateWindowAttributesInternal(bool forceSync) const {
+        std::shared_ptr<SharedState> sharedState = state;
+        NSWindow *nsWindow = (__bridge NSWindow *)sharedState->windowHandle;
         auto updateBlock = ^{
-            NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
-            NSRect contentFrame = [[nsWindow contentView] frame];
-            CGFloat scaleFactor = getScaleFactor(nsWindow);
-
-            std::lock_guard<std::mutex> lock(attributesMutex);
-            cachedAttributes.x = (int)round(contentFrame.origin.x);
-            cachedAttributes.y = (int)round(contentFrame.origin.y);
-            cachedAttributes.width = (int)round(contentFrame.size.width * scaleFactor);
-            cachedAttributes.height = (int)round(contentFrame.size.height * scaleFactor);
+            updateAttributes(*sharedState, nsWindow);
         };
 
         if (forceSync) {
@@ -102,13 +107,11 @@ namespace plume {
         }
     }
 
-    void CocoaWindow::updateRefreshRateInternal(bool forceSync) {
+    void CocoaWindow::updateRefreshRateInternal(bool forceSync) const {
+        std::shared_ptr<SharedState> sharedState = state;
+        NSWindow *nsWindow = (__bridge NSWindow *)sharedState->windowHandle;
         auto updateBlock = ^{
-            NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
-            NSScreen *screen = [nsWindow screen];
-            if (@available(macOS 12.0, *)) {
-                cachedRefreshRate.store((int)[screen maximumFramesPerSecond]);
-            }
+            updateRefreshRate(*sharedState, nsWindow);
         };
 
         if (forceSync) {
@@ -120,57 +123,47 @@ namespace plume {
 
     void CocoaWindow::getWindowAttributes(CocoaWindowAttributes* attributes) const {
         if ([NSThread isMainThread]) {
-            NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
-            NSRect contentFrame = [[nsWindow contentView] frame];
-            CGFloat scaleFactor = getScaleFactor(nsWindow);
+            updateAttributes(*state, (__bridge NSWindow *)state->windowHandle);
 
-            {
-                std::lock_guard<std::mutex> lock(attributesMutex);
-                const_cast<CocoaWindow*>(this)->cachedAttributes.x = (int)round(contentFrame.origin.x);
-                const_cast<CocoaWindow*>(this)->cachedAttributes.y = (int)round(contentFrame.origin.y);
-                const_cast<CocoaWindow*>(this)->cachedAttributes.width = (int)round(contentFrame.size.width * scaleFactor);
-                const_cast<CocoaWindow*>(this)->cachedAttributes.height = (int)round(contentFrame.size.height * scaleFactor);
-
-                *attributes = cachedAttributes;
-            }
+            std::lock_guard<std::mutex> lock(state->attributesMutex);
+            *attributes = state->cachedAttributes;
         } else {
             {
-                std::lock_guard<std::mutex> lock(attributesMutex);
-                *attributes = cachedAttributes;
+                std::lock_guard<std::mutex> lock(state->attributesMutex);
+                *attributes = state->cachedAttributes;
             }
 
-            const_cast<CocoaWindow*>(this)->updateWindowAttributesInternal(false);
+            updateWindowAttributesInternal(false);
         }
     }
 
     int CocoaWindow::getRefreshRate() const {
         if ([NSThread isMainThread]) {
-            NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
+            NSWindow *nsWindow = (__bridge NSWindow *)state->windowHandle;
             NSScreen *screen = [nsWindow screen];
 
             if (@available(macOS 12.0, *)) {
                 int freshRate = (int)[screen maximumFramesPerSecond];
-                const_cast<CocoaWindow*>(this)->cachedRefreshRate.store(freshRate);
+                state->cachedRefreshRate.store(freshRate);
                 return freshRate;
             }
 
-            return cachedRefreshRate.load();
+            return state->cachedRefreshRate.load();
         } else {
-            int rate = cachedRefreshRate.load();
+            int rate = state->cachedRefreshRate.load();
 
-            const_cast<CocoaWindow*>(this)->updateRefreshRateInternal(false);
+            updateRefreshRateInternal(false);
 
             return rate;
         }
     }
 
     void CocoaWindow::toggleFullscreen() {
+        NSWindow *nsWindow = (__bridge NSWindow *)state->windowHandle;
         if ([NSThread isMainThread]) {
-            NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
             [nsWindow toggleFullScreen:NULL];
         } else {
             dispatch_async(dispatch_get_main_queue(), ^{
-                NSWindow *nsWindow = (__bridge NSWindow *)windowHandle;
                 [nsWindow toggleFullScreen:NULL];
             });
         }
