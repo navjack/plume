@@ -37,6 +37,29 @@ namespace plume {
 #if defined(_WIN64)
     // Native HWND handle to the target window.
     typedef HWND RenderWindow;
+
+    // HWND ownership does not make a caller on another thread DPI-aware.
+    // Scope every native size query, including swap-chain construction and resize.
+    class WindowPixelContext final {
+        DPI_AWARENESS_CONTEXT previous;
+    public:
+        WindowPixelContext() : previous(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {}
+        ~WindowPixelContext() { if (previous) SetThreadDpiAwarenessContext(previous); }
+        WindowPixelContext(const WindowPixelContext &) = delete;
+        WindowPixelContext &operator=(const WindowPixelContext &) = delete;
+        bool ready() const { return previous != nullptr; }
+    };
+
+    inline bool GetWindowClientPixels(HWND window, uint32_t &width, uint32_t &height) {
+        const WindowPixelContext pixels;
+        RECT rect = {};
+        width = height = 0;
+        if (!pixels.ready() || !GetClientRect(window, &rect)) return false;
+        width = uint32_t(rect.right - rect.left);
+        height = uint32_t(rect.bottom - rect.top);
+        return true;
+    }
+
 #elif defined(__ANDROID__)
     typedef ANativeWindow* RenderWindow;
 #elif defined(PLUME_SDL_VULKAN_ENABLED)
@@ -1762,6 +1785,7 @@ namespace plume {
     };
 
     struct RenderDeviceCapabilities {
+        RenderShaderFormat shaderFormat = RenderShaderFormat::UNKNOWN;
         // Geometry shaders.
         bool geometryShader = false;
 

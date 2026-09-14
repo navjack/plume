@@ -235,6 +235,7 @@ namespace plume {
         VkSwapchainCreateInfoKHR createInfo = {};
         VkSurfaceFormatKHR pickedSurfaceFormat = {};
         VkPresentModeKHR createdPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+        bool surfaceOutOfDate = false;
         VkPresentModeKHR requiredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
         VkCompositeAlphaFlagBitsKHR pickedAlphaFlag = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         std::vector<VulkanTexture> textures;
@@ -252,6 +253,7 @@ namespace plume {
         bool isVsyncEnabled() const override;
         uint32_t getWidth() const override;
         uint32_t getHeight() const override;
+        RenderFormat getFormat() const override;
         RenderTexture *getTexture(uint32_t textureIndex) override;
         uint32_t getTextureCount() const override;
         bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
@@ -300,6 +302,7 @@ namespace plume {
         const VulkanFramebuffer *targetFramebuffer = nullptr;
         const VulkanPipelineLayout *activeComputePipelineLayout = nullptr;
         const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
+        std::vector<VkDescriptorSet> activeGraphicsDescriptorSets;
         const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
         VkRenderPass activeRenderPass = VK_NULL_HANDLE;
 

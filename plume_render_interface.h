@@ -95,6 +95,7 @@ namespace plume {
         virtual bool isVsyncEnabled() const = 0;
         virtual uint32_t getWidth() const = 0;
         virtual uint32_t getHeight() const = 0;
+        virtual RenderFormat getFormat() const { return RenderFormat::R8G8B8A8_UNORM; }
         virtual RenderTexture *getTexture(uint32_t textureIndex) = 0;
         virtual uint32_t getTextureCount() const = 0;
         virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
