@@ -108,6 +108,17 @@ if(APPLE)
 
     target_include_directories(plume PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/contrib/metal-cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/metal-shaderconverter
+    )
+
+    # A static plume carries its framework dependencies to every consumer.
+    target_link_libraries(plume PUBLIC
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework Foundation"
+        "-framework CoreFoundation"
+        "-framework IOKit"
+        "-framework AppKit"
     )
 endif()
 
