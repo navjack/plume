@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <mutex>
 
+#define IR_PRIVATE_IMPLEMENTATION
 #include "plume_metal.h"
 
 extern "C" {
@@ -1329,21 +1330,92 @@ namespace plume {
 
     // MetalShader
 
+    // MARK: - Metal Shader Converter
+
+    static bool parseShaderConverterContainer(const uint8_t *&data, uint64_t &size, std::vector<MetalIRResource> &resources, std::string &entryPoint) {
+        MetalIRShaderHeader header;
+        if (size < sizeof(header)) {
+            return false;
+        }
+
+        memcpy(&header, data, sizeof(header));
+        const uint64_t tableSize = uint64_t(header.resourceCount) * sizeof(MetalIRResource);
+        if ((header.magic != MetalIRShaderHeader::MAGIC) || (header.version != MetalIRShaderHeader::VERSION) || (header.metallibSize == 0) ||
+            (sizeof(header) + tableSize + header.entryPointLength + header.metallibSize != size)) {
+            return false;
+        }
+
+        const uint8_t *cursor = data + sizeof(header);
+        resources.resize(header.resourceCount);
+        memcpy(resources.data(), cursor, tableSize);
+        cursor += tableSize;
+        entryPoint.assign(reinterpret_cast<const char *>(cursor), header.entryPointLength);
+        cursor += header.entryPointLength;
+        data = cursor;
+        size = header.metallibSize;
+        return true;
+    }
+
+    static uint32_t shaderConverterTableSize(const std::vector<MetalIRResource> &resources) {
+        uint32_t tableSize = 0;
+        for (const MetalIRResource &resource : resources) {
+            tableSize = std::max<uint32_t>(tableSize, resource.topLevelOffset + sizeof(IRDescriptorTableEntry));
+        }
+
+        return tableSize;
+    }
+
+    static bool isShaderConverterRangeType(MetalIRResourceType resourceType, RenderDescriptorRangeType rangeType) {
+        switch (resourceType) {
+            case MetalIRResourceType::CBV:
+                return rangeType == RenderDescriptorRangeType::CONSTANT_BUFFER;
+            case MetalIRResourceType::SAMPLER:
+                return rangeType == RenderDescriptorRangeType::SAMPLER;
+            case MetalIRResourceType::UAV:
+                return (rangeType == RenderDescriptorRangeType::READ_WRITE_FORMATTED_BUFFER) || (rangeType == RenderDescriptorRangeType::READ_WRITE_TEXTURE) ||
+                    (rangeType == RenderDescriptorRangeType::READ_WRITE_STRUCTURED_BUFFER) || (rangeType == RenderDescriptorRangeType::READ_WRITE_BYTE_ADDRESS_BUFFER);
+            case MetalIRResourceType::SRV:
+                return (rangeType == RenderDescriptorRangeType::FORMATTED_BUFFER) || (rangeType == RenderDescriptorRangeType::TEXTURE) ||
+                    (rangeType == RenderDescriptorRangeType::STRUCTURED_BUFFER) || (rangeType == RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER) ||
+                    (rangeType == RenderDescriptorRangeType::ACCELERATION_STRUCTURE);
+            default:
+                return false;
+        }
+    }
+
+    void SetMetalShaderConverterDescriptorSets(RenderDevice *device, bool enabled) {
+        assert(device != nullptr);
+        static_cast<MetalDevice *>(device)->shaderConverterDescriptorSets = enabled;
+    }
+
     MetalShader::MetalShader(const MetalDevice *device, const void *data, uint64_t size, const char *entryPointName, const RenderShaderFormat format) {
         assert(device != nullptr);
         assert(data != nullptr);
         assert(size > 0);
-        assert(format == RenderShaderFormat::METAL);
+        assert((format == RenderShaderFormat::METAL) || (format == RenderShaderFormat::METAL_IR));
 
         this->format = format;
 
         MetalAutoreleasePool releasePool;
-        functionName = (entryPointName != nullptr) ? NS::String::string(entryPointName, NS::UTF8StringEncoding) : MTLSTR("");
+        const uint8_t *libraryData = static_cast<const uint8_t *>(data);
+        uint64_t librarySize = size;
+        std::string containerEntryPoint;
+        if ((format == RenderShaderFormat::METAL_IR) && !parseShaderConverterContainer(libraryData, librarySize, irResources, containerEntryPoint)) {
+            fprintf(stderr, "MetalShader: invalid Metal Shader Converter shader data.\n");
+            functionName = MTLSTR("");
+            functionName->retain();
+            return;
+        }
+
+        const char *functionEntryPoint = !containerEntryPoint.empty() ? containerEntryPoint.c_str() : entryPointName;
+        functionName = (functionEntryPoint != nullptr) ? NS::String::string(functionEntryPoint, NS::UTF8StringEncoding) : MTLSTR("");
         functionName->retain();
 
         NS::Error *error = nullptr;
-        const dispatch_data_t dispatchData = dispatch_data_create(data, size, dispatch_get_main_queue(), ^{});
+        // Copy the bytes: the caller's buffer may be freed as soon as createShader returns.
+        const dispatch_data_t dispatchData = dispatch_data_create(libraryData, librarySize, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         library = device->mtl->newLibrary(dispatchData, &error);
+        dispatch_release(dispatchData);
 
         if (error != nullptr) {
             fprintf(stderr, "MTLDevice newLibraryWithSource: failed with error %s.\n", error->localizedDescription()->utf8String());
@@ -1509,6 +1581,14 @@ namespace plume {
         MTL::Function *vertexFunction = metalShader->createFunction(desc.specConstants, desc.specConstantsCount);
         descriptor->setVertexFunction(vertexFunction);
 
+        // METAL_IR pipelines read one top-level argument buffer per stage.
+        if (metalShader->format == RenderShaderFormat::METAL_IR) {
+            irBindings = std::make_unique<MetalIRBindings>();
+            irBindings->vertexResources = metalShader->irResources;
+            irBindings->vertexTableSize = shaderConverterTableSize(metalShader->irResources);
+            state.irBindings = irBindings.get();
+        }
+
         MTL::VertexDescriptor *vertexDescriptor = MTL::VertexDescriptor::alloc()->init();
 
         for (uint32_t i = 0; i < desc.inputSlotsCount; i++) {
@@ -1550,6 +1630,12 @@ namespace plume {
             const MetalShader *pixelShader = static_cast<const MetalShader *>(desc.pixelShader);
             MTL::Function *fragmentFunction = pixelShader->createFunction(desc.specConstants, desc.specConstantsCount);
             descriptor->setFragmentFunction(fragmentFunction);
+
+            if (irBindings != nullptr) {
+                assert((pixelShader->format == RenderShaderFormat::METAL_IR) && "METAL_IR vertex shaders need METAL_IR pixel shaders.");
+                irBindings->fragmentResources = pixelShader->irResources;
+                irBindings->fragmentTableSize = shaderConverterTableSize(pixelShader->irResources);
+            }
             fragmentFunction->release();
         }
 
@@ -1664,6 +1750,35 @@ namespace plume {
 
         MetalAutoreleasePool releasePool;
         this->device = device;
+
+        if (device->shaderConverterDescriptorSets) {
+            // METAL_IR pipelines resolve these D3D12-style ranges per draw; register classes may share
+            // binding numbers, so no argument buffer is built.
+            uint32_t descriptorIndexBase = 0;
+            for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
+                const RenderDescriptorRange &range = desc.descriptorRanges[i];
+                const bool boundless = desc.lastRangeIsBoundless && (i == (desc.descriptorRangesCount - 1));
+                const uint32_t count = boundless ? std::max(desc.boundlessRangeSize, 1U) : range.count;
+                shaderConverterRanges.push_back({ range.binding, count, range.type, descriptorIndexBase });
+                descriptorIndexBase += count;
+            }
+
+            resourceEntries.resize(descriptorIndexBase);
+            shaderConverterEntries.resize(descriptorIndexBase);
+            for (uint32_t i = 0; i < desc.descriptorRangesCount; i++) {
+                const RenderDescriptorRange &range = desc.descriptorRanges[i];
+                if (range.immutableSampler == nullptr) {
+                    continue;
+                }
+
+                for (uint32_t j = 0; j < range.count; j++) {
+                    const MetalSampler *sampler = static_cast<const MetalSampler *>(range.immutableSampler[j]);
+                    IRDescriptorTableSetSampler(&shaderConverterEntries[shaderConverterRanges[i].descriptorIndexBase + j], sampler->state, 0.0f);
+                }
+            }
+
+            return;
+        }
 
         thread_local std::unordered_map<RenderDescriptorRangeType, uint32_t> typeCounts;
         typeCounts.clear();
@@ -1806,6 +1921,11 @@ namespace plume {
     }
 
     void MetalDescriptorSet::setDescriptor(const uint32_t descriptorIndex, const Descriptor *descriptor) {
+        if (device->shaderConverterDescriptorSets) {
+            setShaderConverterDescriptor(descriptorIndex, descriptor);
+            return;
+        }
+
         assert(descriptorIndex < setLayout->descriptorBindingIndices.size());
 
         const uint32_t indexBase = setLayout->descriptorIndexBases[descriptorIndex];
@@ -1877,6 +1997,71 @@ namespace plume {
 
         resourceEntries[descriptorIndex].resource = nativeResource;
         resourceEntries[descriptorIndex].type = descriptorType;
+    }
+
+    void MetalDescriptorSet::setShaderConverterDescriptor(const uint32_t descriptorIndex, const Descriptor *descriptor) {
+        assert(descriptorIndex < shaderConverterEntries.size());
+
+        RenderDescriptorRangeType descriptorType = RenderDescriptorRangeType::UNKNOWN;
+        for (const ShaderConverterRange &range : shaderConverterRanges) {
+            if ((descriptorIndex >= range.descriptorIndexBase) && (descriptorIndex < (range.descriptorIndexBase + range.count))) {
+                descriptorType = range.type;
+                break;
+            }
+        }
+
+        IRDescriptorTableEntry entry = {};
+        MTL::Resource *nativeResource = nullptr;
+        if (descriptor != nullptr) {
+            switch (descriptorType) {
+                case RenderDescriptorRangeType::SAMPLER:
+                    IRDescriptorTableSetSampler(&entry, static_cast<const SamplerDescriptor *>(descriptor)->state, 0.0f);
+                    break;
+                case RenderDescriptorRangeType::CONSTANT_BUFFER:
+                case RenderDescriptorRangeType::STRUCTURED_BUFFER:
+                case RenderDescriptorRangeType::READ_WRITE_STRUCTURED_BUFFER:
+                case RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER:
+                case RenderDescriptorRangeType::READ_WRITE_BYTE_ADDRESS_BUFFER: {
+                    const BufferDescriptor *bufferDescriptor = static_cast<const BufferDescriptor *>(descriptor);
+                    const uint64_t length = bufferDescriptor->buffer->length();
+                    const uint64_t available = (length > bufferDescriptor->offset) ? (length - bufferDescriptor->offset) : 0;
+                    IRDescriptorTableSetBuffer(&entry, bufferDescriptor->buffer->gpuAddress() + bufferDescriptor->offset, (available & kIRBufSizeMask) << kIRBufSizeOffset);
+                    nativeResource = bufferDescriptor->buffer;
+                    break;
+                }
+                default: {
+                    // Textures and formatted buffer views.
+                    const TextureDescriptor *textureDescriptor = static_cast<const TextureDescriptor *>(descriptor);
+                    IRDescriptorTableSetTexture(&entry, textureDescriptor->texture, 0.0f, 0);
+                    nativeResource = textureDescriptor->texture;
+                    break;
+                }
+            }
+        }
+
+        if (nativeResource != nullptr) {
+            nativeResource->retain();
+        }
+
+        MTL::Resource *oldResource = resourceEntries[descriptorIndex].resource;
+        if (oldResource != nullptr) {
+            oldResource->release();
+        }
+
+        shaderConverterEntries[descriptorIndex] = entry;
+        resourceEntries[descriptorIndex].resource = nativeResource;
+        resourceEntries[descriptorIndex].type = descriptorType;
+    }
+
+    bool MetalDescriptorSet::findShaderConverterDescriptor(MetalIRResourceType type, uint32_t slot, uint32_t &descriptorIndex) const {
+        for (const ShaderConverterRange &range : shaderConverterRanges) {
+            if (isShaderConverterRangeType(type, range.type) && (slot >= range.binding) && (slot < (range.binding + range.count))) {
+                descriptorIndex = range.descriptorIndexBase + (slot - range.binding);
+                return true;
+            }
+        }
+
+        return false;
     }
 
     RenderDescriptorRangeType MetalDescriptorSet::getDescriptorType(const uint32_t binding) const {
@@ -2240,7 +2425,200 @@ namespace plume {
         timestampQueryFence->setLabel(MTLSTR("Timestamp Query Fence"));
     }
 
+    // MARK: - MetalCommandList METAL_IR support
+
+    struct MetalCommandList::ShaderConverterUploadPool {
+        static constexpr uint64_t CHUNK_SIZE = 256 * 1024;
+
+        MetalDevice *device = nullptr;
+        std::mutex mutex;
+        std::vector<MTL::Buffer *> freeChunks;
+
+        explicit ShaderConverterUploadPool(MetalDevice *device) : device(device) {}
+
+        ~ShaderConverterUploadPool() {
+            for (MTL::Buffer *chunk : freeChunks) {
+                device->removeResource(chunk);
+                chunk->release();
+            }
+        }
+
+        MTL::Buffer *acquire(uint64_t minimumSize) {
+            if (minimumSize <= CHUNK_SIZE) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (!freeChunks.empty()) {
+                    MTL::Buffer *chunk = freeChunks.back();
+                    freeChunks.pop_back();
+                    return chunk;
+                }
+            }
+
+            const uint64_t chunkSize = std::max(CHUNK_SIZE, (minimumSize + 15) & ~uint64_t(15));
+            MTL::Buffer *chunk = device->mtl->newBuffer(chunkSize, MTL::ResourceStorageModeShared);
+            if (chunk != nullptr) {
+                device->addResource(chunk);
+            }
+
+            return chunk;
+        }
+
+        void recycle(const std::vector<MTL::Buffer *> &chunks) {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (MTL::Buffer *chunk : chunks) {
+                if (chunk->length() == CHUNK_SIZE) {
+                    freeChunks.push_back(chunk);
+                } else {
+                    device->removeResource(chunk);
+                    chunk->release();
+                }
+            }
+        }
+    };
+
+    MetalCommandList::ShaderConverterUpload MetalCommandList::allocateShaderConverterUpload(uint64_t size) {
+        const uint64_t alignedSize = (size + 15) & ~uint64_t(15);
+        if (!shaderConverterUploadPool) {
+            shaderConverterUploadPool = std::make_shared<ShaderConverterUploadPool>(device);
+        }
+
+        if (shaderConverterUploadChunks.empty() || ((shaderConverterUploadOffset + alignedSize) > shaderConverterUploadChunks.back()->length())) {
+            MTL::Buffer *chunk = shaderConverterUploadPool->acquire(alignedSize);
+            if (chunk == nullptr) {
+                return {};
+            }
+
+            shaderConverterUploadChunks.push_back(chunk);
+            shaderConverterUploadOffset = 0;
+        }
+
+        MTL::Buffer *chunk = shaderConverterUploadChunks.back();
+        ShaderConverterUpload upload;
+        upload.buffer = chunk;
+        upload.offset = shaderConverterUploadOffset;
+        upload.data = static_cast<uint8_t *>(chunk->contents()) + shaderConverterUploadOffset;
+        shaderConverterUploadOffset += alignedSize;
+        return upload;
+    }
+
+    void MetalCommandList::releaseShaderConverterUploads() {
+        if (!shaderConverterUploadChunks.empty() && shaderConverterUploadPool) {
+            shaderConverterUploadPool->recycle(shaderConverterUploadChunks);
+        }
+
+        shaderConverterUploadChunks.clear();
+        shaderConverterUploadOffset = 0;
+    }
+
+    void MetalCommandList::encodeShaderConverterArgumentBuffers() {
+        const MetalIRBindings &bindings = *activeRenderState->irBindings;
+        if (bindings.vertexTableSize > 0) {
+            fillShaderConverterTable(shaderConverterVertexTable, bindings.vertexResources, bindings.vertexTableSize, MTL::RenderStageVertex);
+            bindShaderConverterTable(shaderConverterVertexTable, true);
+        }
+
+        if (bindings.fragmentTableSize > 0) {
+            fillShaderConverterTable(shaderConverterFragmentTable, bindings.fragmentResources, bindings.fragmentTableSize, MTL::RenderStageFragment);
+            bindShaderConverterTable(shaderConverterFragmentTable, false);
+        }
+    }
+
+    void MetalCommandList::fillShaderConverterTable(std::vector<uint8_t> &table, const std::vector<MetalIRResource> &resources, uint32_t tableSize, MTL::RenderStages stages) {
+        table.assign(tableSize, 0);
+        const bool trackResources = (device->residencySet == nullptr);
+        for (const MetalIRResource &resource : resources) {
+            IRDescriptorTableEntry entry = {};
+            const bool resolved = (resource.type == MetalIRResourceType::CBV) && resolveShaderConverterConstantBuffer(resource, entry, stages);
+            if (!resolved && (resource.space < MAX_DESCRIPTOR_SET_BINDINGS)) {
+                MetalDescriptorSet *descriptorSet = renderDescriptorSets[resource.space];
+                uint32_t descriptorIndex = 0;
+                if ((descriptorSet != nullptr) && descriptorSet->findShaderConverterDescriptor(resource.type, resource.slot, descriptorIndex)) {
+                    entry = descriptorSet->shaderConverterEntries[descriptorIndex];
+                    if (trackResources) {
+                        currentEncoderDescriptorSets.insert(descriptorSet);
+                    }
+                }
+            }
+
+            memcpy(table.data() + resource.topLevelOffset, &entry, sizeof(entry));
+        }
+    }
+
+    bool MetalCommandList::resolveShaderConverterConstantBuffer(const MetalIRResource &resource, IRDescriptorTableEntry &entry, MTL::RenderStages stages) {
+        const bool trackResources = (device->residencySet == nullptr);
+        if (activeGraphicsPipelineLayout != nullptr) {
+            const std::vector<RenderRootDescriptorDesc> &rootDescs = activeGraphicsPipelineLayout->rootDescriptorDescs;
+            for (size_t i = 0; i < rootDescs.size(); i++) {
+                const RenderRootDescriptorDesc &rootDesc = rootDescs[i];
+                if ((rootDesc.type != RenderRootDescriptorType::CONSTANT_BUFFER) || (rootDesc.shaderRegister != resource.slot) || (rootDesc.registerSpace != resource.space)) {
+                    continue;
+                }
+
+                const MetalBuffer *buffer = (i < rootDescriptors.size()) ? static_cast<const MetalBuffer *>(rootDescriptors[i].ref) : nullptr;
+                if ((buffer != nullptr) && (buffer->mtl != nullptr)) {
+                    const uint64_t offset = rootDescriptors[i].offset;
+                    const uint64_t length = buffer->mtl->length();
+                    const uint64_t available = (length > offset) ? (length - offset) : 0;
+                    IRDescriptorTableSetBuffer(&entry, buffer->mtl->gpuAddress() + offset, (available & kIRBufSizeMask) << kIRBufSizeOffset);
+                    if (trackResources) {
+                        activeRenderEncoder->useResource(buffer->mtl, MTL::ResourceUsageRead, stages);
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        for (const PushConstantData &pushConstant : pushConstants) {
+            if ((pushConstant.binding != resource.slot) || (pushConstant.set != resource.space) || pushConstant.data.empty()) {
+                continue;
+            }
+
+            const ShaderConverterUpload upload = allocateShaderConverterUpload(pushConstant.data.size());
+            if (upload.buffer != nullptr) {
+                memcpy(upload.data, pushConstant.data.data(), pushConstant.data.size());
+                IRDescriptorTableSetBuffer(&entry, upload.buffer->gpuAddress() + upload.offset, (pushConstant.data.size() & kIRBufSizeMask) << kIRBufSizeOffset);
+                if (trackResources) {
+                    activeRenderEncoder->useResource(upload.buffer, MTL::ResourceUsageRead, stages);
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    void MetalCommandList::bindShaderConverterTable(const std::vector<uint8_t> &table, bool vertex) {
+        // Inline bytes are intended for data up to 4 KB; larger tables go through an upload chunk.
+        if (table.size() <= 4096) {
+            if (vertex) {
+                activeRenderEncoder->setVertexBytes(table.data(), table.size(), kIRArgumentBufferBindPoint);
+            } else {
+                activeRenderEncoder->setFragmentBytes(table.data(), table.size(), kIRArgumentBufferBindPoint);
+            }
+
+            return;
+        }
+
+        const ShaderConverterUpload upload = allocateShaderConverterUpload(table.size());
+        if (upload.buffer == nullptr) {
+            return;
+        }
+
+        memcpy(upload.data, table.data(), table.size());
+        if (vertex) {
+            activeRenderEncoder->setVertexBuffer(upload.buffer, upload.offset, kIRArgumentBufferBindPoint);
+        } else {
+            activeRenderEncoder->setFragmentBuffer(upload.buffer, upload.offset, kIRArgumentBufferBindPoint);
+        }
+
+        if (device->residencySet == nullptr) {
+            activeRenderEncoder->useResource(upload.buffer, MTL::ResourceUsageRead, vertex ? MTL::RenderStageVertex : MTL::RenderStageFragment);
+        }
+    }
+
     MetalCommandList::~MetalCommandList() {
+        releaseShaderConverterUploads();
         MetalAutoreleasePool releasePool;
 
         if (mtl != nullptr) {
@@ -2293,6 +2671,17 @@ namespace plume {
     }
 
     void MetalCommandList::commit() {
+        if (!shaderConverterUploadChunks.empty()) {
+            // Upload chunks return to the pool once the GPU has finished this command buffer.
+            std::shared_ptr<ShaderConverterUploadPool> pool = shaderConverterUploadPool;
+            std::vector<MTL::Buffer *> chunks = std::move(shaderConverterUploadChunks);
+            shaderConverterUploadChunks.clear();
+            shaderConverterUploadOffset = 0;
+            mtl->addCompletedHandler([pool, chunks](MTL::CommandBuffer *) {
+                pool->recycle(chunks);
+            });
+        }
+
         mtl->commit();
         mtl->release();
         mtl = nullptr;
@@ -2495,6 +2884,14 @@ namespace plume {
         checkActiveRenderEncoder();
         checkForUpdatesInGraphicsState();
 
+        if (activeRenderState->irBindings != nullptr) {
+            // METAL_IR vertex shaders read D3D draw arguments for SV_VertexID and SV_InstanceID.
+            IRRuntimeDrawParams params = {};
+            params.draw = { vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation };
+            activeRenderEncoder->setVertexBytes(&params, sizeof(params), kIRArgumentBufferDrawArgumentsBindPoint);
+            activeRenderEncoder->setVertexBytes(&kIRNonIndexedDraw, sizeof(kIRNonIndexedDraw), kIRArgumentBufferUniformsBindPoint);
+        }
+
         activeRenderEncoder->drawPrimitives(activeRenderState->primitiveType, startVertexLocation, vertexCountPerInstance, instanceCount, startInstanceLocation);
     }
 
@@ -2504,6 +2901,20 @@ namespace plume {
         MetalAutoreleasePool releasePool;
         checkActiveRenderEncoder();
         checkForUpdatesInGraphicsState();
+
+        if ((activeRenderState != nullptr) && (activeRenderState->irBindings != nullptr)) {
+            IRRuntimeDrawIndexedArgument argument = {};
+            argument.indexCountPerInstance = indexCountPerInstance;
+            argument.instanceCount = instanceCount;
+            argument.startIndexLocation = startIndexLocation;
+            argument.baseVertexLocation = baseVertexLocation;
+            argument.startInstanceLocation = startInstanceLocation;
+            IRRuntimeDrawParams params = {};
+            params.drawIndexed = argument;
+            const uint16_t indexType = IRMetalIndexToIRIndex(currentIndexType);
+            activeRenderEncoder->setVertexBytes(&params, sizeof(params), kIRArgumentBufferDrawArgumentsBindPoint);
+            activeRenderEncoder->setVertexBytes(&indexType, sizeof(indexType), kIRArgumentBufferUniformsBindPoint);
+        }
 
         activeRenderEncoder->drawIndexedPrimitives(currentPrimitiveType, indexCountPerInstance, currentIndexType, indexBuffer, indexBufferOffset + (startIndexLocation * indexTypeSize), instanceCount, baseVertexLocation, startInstanceLocation);
     }
@@ -2613,6 +3024,7 @@ namespace plume {
             // Mark graphics states as dirty that need to be rebound
             dirtyGraphicsState.descriptorSets = 1;
             dirtyGraphicsState.pushConstants = 1;
+            rootDescriptors.clear();
             dirtyGraphicsState.descriptorSetDirtyIndex = 0;
         }
     }
@@ -2649,7 +3061,15 @@ namespace plume {
     }
 
     void MetalCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
-        assert(false && "Root descriptors are not supported in Metal.");
+        // Root descriptors only reach shaders through METAL_IR pipelines.
+        assert(activeGraphicsPipelineLayout != nullptr);
+        assert(rootDescriptorIndex < activeGraphicsPipelineLayout->rootDescriptorDescs.size());
+        if (rootDescriptors.size() <= rootDescriptorIndex) {
+            rootDescriptors.resize(rootDescriptorIndex + 1);
+        }
+
+        rootDescriptors[rootDescriptorIndex] = bufferReference;
+        dirtyGraphicsState.descriptorSets = 1;
     }
 
     void MetalCommandList::setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
@@ -3490,6 +3910,20 @@ namespace plume {
         }
 
         // Descriptor sets
+        if ((activeRenderState != nullptr) && (activeRenderState->irBindings != nullptr)) {
+            // METAL_IR pipelines take one top-level argument buffer per stage, built from descriptor
+            // sets, root descriptors and push constants.
+            if (dirtyGraphicsState.descriptorSets || dirtyGraphicsState.pushConstants || (lastShaderConverterBindings != activeRenderState->irBindings)) {
+                encodeShaderConverterArgumentBuffers();
+                lastShaderConverterBindings = activeRenderState->irBindings;
+            }
+
+            dirtyGraphicsState.descriptorSets = 0;
+            dirtyGraphicsState.descriptorSetDirtyIndex = MAX_DESCRIPTOR_SET_BINDINGS;
+            dirtyGraphicsState.pushConstants = 0;
+            return;
+        }
+
         if (dirtyGraphicsState.descriptorSets) {
             if (activeGraphicsPipelineLayout) {
                 activeGraphicsPipelineLayout->bindDescriptorSets(activeRenderEncoder, renderDescriptorSets, MAX_DESCRIPTOR_SET_BINDINGS, false, dirtyGraphicsState.descriptorSetDirtyIndex, currentEncoderDescriptorSets, device->residencySet != nullptr);
@@ -3742,6 +4176,7 @@ namespace plume {
 
         pushConstantRanges.resize(desc.pushConstantRangesCount);
         memcpy(pushConstantRanges.data(), desc.pushConstantRanges, sizeof(RenderPushConstantRange) * desc.pushConstantRangesCount);
+        rootDescriptorDescs.assign(desc.rootDescriptorDescs, desc.rootDescriptorDescs + desc.rootDescriptorDescsCount);
     }
 
     MetalPipelineLayout::~MetalPipelineLayout() {}

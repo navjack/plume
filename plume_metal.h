@@ -18,6 +18,13 @@
 #include <QuartzCore/QuartzCore.hpp>
 #include <TargetConditionals.h>
 
+// Apple Metal Shader Converter runtime, used by RenderShaderFormat::METAL_IR pipelines.
+#ifndef IR_RUNTIME_METALCPP
+#    define IR_RUNTIME_METALCPP
+#endif
+#include "metal_irconverter_runtime.h"
+#include "plume_metal_ir.h"
+
 /// macOS
 #ifndef PLUME_MACOS
 #    define PLUME_MACOS                (TARGET_OS_OSX || TARGET_OS_MACCATALYST)
@@ -185,6 +192,14 @@ namespace plume {
         uint32_t threadGroupSizeZ = 0;
     };
 
+    // Resource tables of a METAL_IR graphics pipeline, one per stage.
+    struct MetalIRBindings {
+        std::vector<MetalIRResource> vertexResources;
+        std::vector<MetalIRResource> fragmentResources;
+        uint32_t vertexTableSize = 0;
+        uint32_t fragmentTableSize = 0;
+    };
+
     struct MetalRenderState {
         MTL::RenderPipelineState *renderPipelineState = nullptr;
         MTL::DepthStencilState *depthStencilState = nullptr;
@@ -197,6 +212,8 @@ namespace plume {
         float depthBiasClamp;
         float depthBiasSlopeFactor;
         bool dynamicDepthBiasEnabled;
+        // METAL_IR pipelines only; owned by MetalGraphicsPipeline.
+        const MetalIRBindings *irBindings = nullptr;
     };
 
     struct ExtendedRenderTexture : RenderTexture {
@@ -217,6 +234,17 @@ namespace plume {
         MetalArgumentBuffer argumentBuffer;
         std::vector<ResourceEntry> resourceEntries;
 
+        // Shader converter mode (SetMetalShaderConverterDescriptorSets): D3D12-style ranges and one
+        // table entry per descriptor instead of an argument buffer.
+        struct ShaderConverterRange {
+            uint32_t binding;
+            uint32_t count;
+            RenderDescriptorRangeType type;
+            uint32_t descriptorIndexBase;
+        };
+        std::vector<ShaderConverterRange> shaderConverterRanges;
+        std::vector<IRDescriptorTableEntry> shaderConverterEntries;
+
         MetalDescriptorSet(MetalDevice *device, const RenderDescriptorSetDesc &desc);
         MetalDescriptorSet(MetalDevice *device, uint32_t entryCount);
         ~MetalDescriptorSet() override;
@@ -227,6 +255,8 @@ namespace plume {
         void setDescriptor(uint32_t descriptorIndex, const Descriptor *descriptor);
         void bindImmutableSamplers() const;
         RenderDescriptorRangeType getDescriptorType(uint32_t binding) const;
+        void setShaderConverterDescriptor(uint32_t descriptorIndex, const Descriptor *descriptor);
+        bool findShaderConverterDescriptor(MetalIRResourceType type, uint32_t slot, uint32_t &descriptorIndex) const;
     };
 
     struct MetalSwapChain : RenderSwapChain {
@@ -448,6 +478,28 @@ namespace plume {
         MTL::Fence *timestampQueryFence = nullptr;
 
         std::unordered_set<MetalDescriptorSet*> currentEncoderDescriptorSets;
+
+        // METAL_IR pipeline state: root descriptors, per-stage top-level argument buffers and upload
+        // chunks for push constants or oversized tables, recycled after the GPU finishes.
+        struct ShaderConverterUploadPool;
+        struct ShaderConverterUpload {
+            MTL::Buffer *buffer = nullptr;
+            uint64_t offset = 0;
+            uint8_t *data = nullptr;
+        };
+        std::vector<RenderBufferReference> rootDescriptors;
+        std::vector<uint8_t> shaderConverterVertexTable;
+        std::vector<uint8_t> shaderConverterFragmentTable;
+        const MetalIRBindings *lastShaderConverterBindings = nullptr;
+        std::shared_ptr<ShaderConverterUploadPool> shaderConverterUploadPool;
+        std::vector<MTL::Buffer *> shaderConverterUploadChunks;
+        uint64_t shaderConverterUploadOffset = 0;
+        ShaderConverterUpload allocateShaderConverterUpload(uint64_t size);
+        void releaseShaderConverterUploads();
+        void encodeShaderConverterArgumentBuffers();
+        void fillShaderConverterTable(std::vector<uint8_t> &table, const std::vector<MetalIRResource> &resources, uint32_t tableSize, MTL::RenderStages stages);
+        bool resolveShaderConverterConstantBuffer(const MetalIRResource &resource, IRDescriptorTableEntry &entry, MTL::RenderStages stages);
+        void bindShaderConverterTable(const std::vector<uint8_t> &table, bool vertex);
         void bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute);
 
         MetalCommandList(const MetalCommandQueue *queue);
@@ -634,6 +686,7 @@ namespace plume {
         NS::String *functionName = nullptr;
         RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
         MTL::Library *library = nullptr;
+        std::vector<MetalIRResource> irResources; // METAL_IR only.
         NS::String *debugName = nullptr;
 
         MetalShader(const MetalDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
@@ -677,6 +730,8 @@ namespace plume {
     struct MetalGraphicsPipeline : MetalPipeline {
         MetalRenderState state;
 
+        std::unique_ptr<MetalIRBindings> irBindings;
+
         MetalGraphicsPipeline(const MetalDevice *device, const RenderGraphicsPipelineDesc &desc);
         ~MetalGraphicsPipeline() override;
         void setName(const std::string &name) override;
@@ -686,6 +741,7 @@ namespace plume {
     struct MetalPipelineLayout : RenderPipelineLayout {
         std::vector<RenderPushConstantRange> pushConstantRanges;
         uint32_t setLayoutCount = 0;
+        std::vector<RenderRootDescriptorDesc> rootDescriptorDescs;
 
         MetalPipelineLayout(MetalDevice *device, const RenderPipelineLayoutDesc &desc);
         ~MetalPipelineLayout() override;
@@ -699,6 +755,8 @@ namespace plume {
         RenderDeviceDescription description;
         bool useArgumentBuffersTier2 = false;
         bool useDirectBufferAddresses = false;
+        // See SetMetalShaderConverterDescriptorSets.
+        bool shaderConverterDescriptorSets = false;
 
         // Resolve functionality
         MTL::ComputePipelineState *resolveTexturePipelineState;

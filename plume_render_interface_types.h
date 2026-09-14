@@ -372,7 +372,9 @@ namespace plume {
         UNKNOWN,
         DXIL,
         SPIRV,
-        METAL
+        METAL,
+        // Metal Shader Converter output wrapped as described in plume_metal_ir.h.
+        METAL_IR
     };
 
     enum class RenderRaytracingPipelineLibrarySymbolType {
