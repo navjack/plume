@@ -1324,7 +1324,12 @@ namespace plume {
     }
 
     std::unique_ptr<RenderTexture> MetalPool::createTexture(const RenderTextureDesc &desc) {
-        return std::make_unique<MetalTexture>(device, this, desc);
+        // Report native allocation failure so callers can fall back.
+        auto texture = std::make_unique<MetalTexture>(device, this, desc);
+        if (texture->mtl == nullptr) {
+            return nullptr;
+        }
+        return texture;
     }
 
     // MetalShader
@@ -2864,6 +2869,15 @@ namespace plume {
     }
 
     void MetalCommandList::clearDepthStencil(const bool clearDepth, const bool clearStencil, const float depthValue, const uint32_t stencilValue, const RenderRect *clearRects, const uint32_t clearRectsCount) {
+        // Submit large rect lists in batches, as the D3D12 backend does.
+        if (clearRects != nullptr && clearRectsCount > MAX_CLEAR_RECTS) {
+            for (uint32_t first = 0; first < clearRectsCount; first += MAX_CLEAR_RECTS) {
+                const uint32_t count = std::min<uint32_t>(clearRectsCount - first, MAX_CLEAR_RECTS);
+                clearDepthStencil(clearDepth, clearStencil, depthValue, stencilValue, clearRects + first, count);
+            }
+            return;
+        }
+
         assert(targetFramebuffer != nullptr);
         assert(targetFramebuffer->depthAttachment.format != RenderFormat::UNKNOWN);
         assert((!clearRects || clearRectsCount <= MAX_CLEAR_RECTS) && "Too many clear rects");
@@ -3020,6 +3034,48 @@ namespace plume {
                 dstLocation.subresource.arrayIndex,
                 dstLocation.subresource.mipLevel,
                 dstOrigin
+            );
+            activeBlitEncoder->popDebugGroup();
+        } else if (dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT && srcLocation.type == RenderTextureCopyType::SUBRESOURCE) {
+            // Texture readback into a CPU-visible buffer.
+            assert(dstBuffer != nullptr);
+            assert(srcTexture != nullptr);
+
+            const RenderFormat format = dstLocation.placedFootprint.format;
+            const uint32_t blockWidth = RenderFormatBlockWidth(format);
+            MTL::Origin srcOrigin = { 0, 0, 0 };
+            MTL::Size size = { dstLocation.placedFootprint.width, dstLocation.placedFootprint.height, dstLocation.placedFootprint.depth };
+            if (srcBox != nullptr) {
+                srcOrigin = { NS::UInteger(srcBox->left), NS::UInteger(srcBox->top), NS::UInteger(srcBox->front) };
+                size = { NS::UInteger(srcBox->right - srcBox->left), NS::UInteger(srcBox->bottom - srcBox->top), NS::UInteger(srcBox->back - srcBox->front) };
+            }
+
+            // Metal rejects copies that extend past the source mip level.
+            const NS::UInteger levelWidth = std::max<NS::UInteger>(srcTexture->desc.width >> srcLocation.subresource.mipLevel, 1);
+            const NS::UInteger levelHeight = std::max<NS::UInteger>(srcTexture->desc.height >> srcLocation.subresource.mipLevel, 1);
+            size.width = std::min<NS::UInteger>(size.width, levelWidth - srcOrigin.x);
+            size.height = std::min<NS::UInteger>(size.height, levelHeight - srcOrigin.y);
+            size.depth = std::max<NS::UInteger>(size.depth, 1);
+
+            const uint32_t horizontalBlocks = (dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth;
+            const uint32_t verticalBlocks = (uint32_t(size.height) + blockWidth - 1) / blockWidth;
+            const NS::UInteger bytesPerRow = NS::UInteger(horizontalBlocks) * RenderFormatSize(format);
+            const NS::UInteger bytesPerImage = bytesPerRow * verticalBlocks;
+            // Combined depth-stencil textures need an explicit aspect to read depth.
+            const MTL::BlitOption options = RenderFormatIsStencil(srcTexture->desc.format) ? MTL::BlitOptionDepthFromDepthStencil : MTL::BlitOptionNone;
+
+            activeBlitEncoder->pushDebugGroup(MTLSTR("ReadbackTextureRegion"));
+            activeBlitEncoder->copyFromTexture(
+                srcTexture->mtl,
+                srcLocation.subresource.arrayIndex,
+                srcLocation.subresource.mipLevel,
+                srcOrigin,
+                size,
+                dstBuffer->mtl,
+                dstLocation.placedFootprint.offset,
+                bytesPerRow,
+                bytesPerImage,
+                options
             );
             activeBlitEncoder->popDebugGroup();
         } else {
@@ -3910,11 +3966,21 @@ namespace plume {
     }
 
     std::unique_ptr<RenderBuffer> MetalDevice::createBuffer(const RenderBufferDesc &desc) {
-        return std::make_unique<MetalBuffer>(this, nullptr, desc);
+        // Report native allocation failure so callers can fall back.
+        auto buffer = std::make_unique<MetalBuffer>(this, nullptr, desc);
+        if (buffer->mtl == nullptr && desc.size > 0) {
+            return nullptr;
+        }
+        return buffer;
     }
 
     std::unique_ptr<RenderTexture> MetalDevice::createTexture(const RenderTextureDesc &desc) {
-        return std::make_unique<MetalTexture>(this, nullptr, desc);
+        // Report native allocation failure so callers can fall back.
+        auto texture = std::make_unique<MetalTexture>(this, nullptr, desc);
+        if (texture->mtl == nullptr) {
+            return nullptr;
+        }
+        return texture;
     }
 
     std::unique_ptr<RenderAccelerationStructure> MetalDevice::createAccelerationStructure(const RenderAccelerationStructureDesc &desc) {
