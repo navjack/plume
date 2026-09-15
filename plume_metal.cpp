@@ -68,6 +68,30 @@ namespace plume {
         return key.value;
     }
 
+    // Same key as createClearPipelineKey, built from the formats a clear will use, so the cached
+    // pipeline can be found without allocating a render pipeline descriptor for every clear.
+    uint64_t clearPipelineKey(bool depthWriteEnabled, bool stencilWriteEnabled, uint32_t sampleCount,
+        const MTL::PixelFormat *colorFormats, uint32_t colorFormatCount, MTL::PixelFormat depthFormat) {
+        auto colorFormat = [&](uint32_t index) {
+            return (index < colorFormatCount) ? static_cast<uint64_t>(mapRenderFormat(colorFormats[index])) : 0llu;
+        };
+
+        ClearPipelineKey key;
+        key.value = 0;
+        key.depthClear = depthWriteEnabled ? 1 : 0;
+        key.stencilClear = stencilWriteEnabled ? 1 : 0;
+        key.msaaCount = sampleCount;
+        key.colorFormat0 = colorFormat(0);
+        key.colorFormat1 = colorFormat(1);
+        key.colorFormat2 = colorFormat(2);
+        key.colorFormat3 = colorFormat(3);
+        key.colorFormat4 = colorFormat(4);
+        key.colorFormat5 = colorFormat(5);
+        key.colorFormat6 = colorFormat(6);
+        key.depthFormat = static_cast<uint64_t>(mapRenderFormat(depthFormat));
+        return key.value;
+    }
+
     NS::UInteger alignmentForRenderFormat(MTL::Device *device, RenderFormat format) {
         const auto deviceAlignment = device->minimumLinearTextureAlignmentForPixelFormat(mapPixelFormat(format));
 
@@ -2725,6 +2749,14 @@ namespace plume {
     }
 
     void MetalCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
+        // Rebinding the target of the open render encoder is a no-op. Ending the encoder here would
+        // start a new render pass per draw for callers that set the framebuffer before every draw,
+        // and render pass creation dominates encoding time on Apple GPUs.
+        if ((framebuffer != nullptr) && (framebuffer == targetFramebuffer) && (activeType == EncoderType::Render) &&
+            (activeRenderEncoder != nullptr) && !pendingClears.active) {
+            return;
+        }
+
         MetalAutoreleasePool releasePool;
         endOtherEncoders(EncoderType::Render);
         endActiveRenderEncoder();
@@ -2797,34 +2829,45 @@ namespace plume {
         // Process clears
         activeRenderEncoder->pushDebugGroup(MTLSTR("ColorClear"));
 
-        MTL::RenderPipelineDescriptor* pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
-        pipelineDesc->setVertexFunction(device->clearVertexFunction);
-        pipelineDesc->setFragmentFunction(device->clearColorFunction);
-        pipelineDesc->setRasterSampleCount(targetFramebuffer->colorAttachments[attachmentIndex].sampleCount);
-
-        MTL::RenderPipelineColorAttachmentDescriptor *pipelineColorAttachment = pipelineDesc->colorAttachments()->object(attachmentIndex);
-        pipelineColorAttachment->setPixelFormat(targetFramebuffer->colorAttachments[attachmentIndex].getTexture()->pixelFormat());
-        pipelineColorAttachment->setBlendingEnabled(false);
-
-        // Set pixel format for depth attachment if we have one, with write disabled
-        if (targetFramebuffer->depthAttachment.format != RenderFormat::UNKNOWN) {
-            pipelineDesc->setDepthAttachmentPixelFormat(targetFramebuffer->depthAttachment.getTexture()->pixelFormat());
-            if (RenderFormatIsStencil(targetFramebuffer->depthAttachment.format)) {
-                pipelineDesc->setStencilAttachmentPixelFormat(pipelineDesc->depthAttachmentPixelFormat());
-            }
-            MTL::DepthStencilDescriptor *depthStencilDescriptor = MTL::DepthStencilDescriptor::alloc()->init();
-            depthStencilDescriptor->setDepthWriteEnabled(false);
-            const MTL::DepthStencilState *depthStencilState = device->mtl->newDepthStencilState(depthStencilDescriptor);
-            activeRenderEncoder->setDepthStencilState(depthStencilState);
-
-            depthStencilDescriptor->release();
+        const bool hasDepth = targetFramebuffer->depthAttachment.format != RenderFormat::UNKNOWN;
+        const MTL::PixelFormat depthPixelFormat = hasDepth ? targetFramebuffer->depthAttachment.getTexture()->pixelFormat() : MTL::PixelFormatInvalid;
+        if (hasDepth) {
+            // Cached device state; creating one here per clear leaked a depth-stencil state each time.
+            activeRenderEncoder->setDepthStencilState(device->clearColorDepthState);
         }
 
-        const MTL::RenderPipelineState *pipelineState = device->getOrCreateClearRenderPipelineState(pipelineDesc);
-        activeRenderEncoder->setRenderPipelineState(pipelineState);
+        // Look up the cached pipeline before allocating a descriptor; only a cache miss builds one.
+        MTL::PixelFormat colorFormats[7] = {};
+        if (attachmentIndex < 7) {
+            colorFormats[attachmentIndex] = targetFramebuffer->colorAttachments[attachmentIndex].getTexture()->pixelFormat();
+        }
+        const uint32_t sampleCount = targetFramebuffer->colorAttachments[attachmentIndex].sampleCount;
+        const uint64_t pipelineKey = clearPipelineKey(false, false, sampleCount, colorFormats, 7, depthPixelFormat);
+        const MTL::RenderPipelineState *pipelineState = device->findClearRenderPipelineState(pipelineKey);
+        if (pipelineState == nullptr) {
+            MTL::RenderPipelineDescriptor* pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
+            pipelineDesc->setVertexFunction(device->clearVertexFunction);
+            pipelineDesc->setFragmentFunction(device->clearColorFunction);
+            pipelineDesc->setRasterSampleCount(sampleCount);
 
+            MTL::RenderPipelineColorAttachmentDescriptor *pipelineColorAttachment = pipelineDesc->colorAttachments()->object(attachmentIndex);
+            pipelineColorAttachment->setPixelFormat(targetFramebuffer->colorAttachments[attachmentIndex].getTexture()->pixelFormat());
+            pipelineColorAttachment->setBlendingEnabled(false);
+
+            // Set pixel format for depth attachment if we have one, with write disabled
+            if (hasDepth) {
+                pipelineDesc->setDepthAttachmentPixelFormat(depthPixelFormat);
+                if (RenderFormatIsStencil(targetFramebuffer->depthAttachment.format)) {
+                    pipelineDesc->setStencilAttachmentPixelFormat(depthPixelFormat);
+                }
+            }
+
+            pipelineState = device->getOrCreateClearRenderPipelineState(pipelineDesc);
+            pipelineDesc->release();
+        }
+
+        activeRenderEncoder->setRenderPipelineState(pipelineState);
         setCommonClearState();
-        pipelineDesc->release();
 
         // Generate vertices for each rect
         const uint32_t rectCount = clearRectsCount > 0 ? clearRectsCount : 1;
@@ -2897,23 +2940,35 @@ namespace plume {
             // Process clears
             activeRenderEncoder->pushDebugGroup(MTLSTR("DepthClear"));
 
-            MTL::RenderPipelineDescriptor* pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
-            pipelineDesc->setVertexFunction(device->clearVertexFunction);
-            pipelineDesc->setFragmentFunction(device->clearDepthFunction);
-            pipelineDesc->setDepthAttachmentPixelFormat(targetFramebuffer->depthAttachment.getTexture()->pixelFormat());
-            if (RenderFormatIsStencil(targetFramebuffer->depthAttachment.format)) {
-                pipelineDesc->setStencilAttachmentPixelFormat(pipelineDesc->depthAttachmentPixelFormat());
+            // Look up the cached pipeline before allocating a descriptor; only a cache miss builds one.
+            const MTL::PixelFormat depthPixelFormat = targetFramebuffer->depthAttachment.getTexture()->pixelFormat();
+            const uint32_t colorCount = static_cast<uint32_t>(std::min<size_t>(targetFramebuffer->colorAttachments.size(), 7));
+            MTL::PixelFormat colorFormats[7] = {};
+            for (uint32_t j = 0; j < colorCount; j++) {
+                colorFormats[j] = targetFramebuffer->colorAttachments[j].getTexture()->pixelFormat();
             }
-            pipelineDesc->setRasterSampleCount(targetFramebuffer->depthAttachment.sampleCount);
+            const uint64_t pipelineKey = clearPipelineKey(clearDepth, clearStencil, targetFramebuffer->depthAttachment.sampleCount, colorFormats, colorCount, depthPixelFormat);
+            const MTL::RenderPipelineState *pipelineState = device->findClearRenderPipelineState(pipelineKey);
+            if (pipelineState == nullptr) {
+                MTL::RenderPipelineDescriptor* pipelineDesc = MTL::RenderPipelineDescriptor::alloc()->init();
+                pipelineDesc->setVertexFunction(device->clearVertexFunction);
+                pipelineDesc->setFragmentFunction(device->clearDepthFunction);
+                pipelineDesc->setDepthAttachmentPixelFormat(depthPixelFormat);
+                if (RenderFormatIsStencil(targetFramebuffer->depthAttachment.format)) {
+                    pipelineDesc->setStencilAttachmentPixelFormat(depthPixelFormat);
+                }
+                pipelineDesc->setRasterSampleCount(targetFramebuffer->depthAttachment.sampleCount);
 
-            // Set color attachment pixel formats with write disabled
-            for (uint32_t j = 0; j < targetFramebuffer->colorAttachments.size(); j++) {
-                MTL::RenderPipelineColorAttachmentDescriptor *pipelineColorAttachment = pipelineDesc->colorAttachments()->object(j);
-                pipelineColorAttachment->setPixelFormat(targetFramebuffer->colorAttachments[j].getTexture()->pixelFormat());
-                pipelineColorAttachment->setWriteMask(MTL::ColorWriteMaskNone);
+                // Set color attachment pixel formats with write disabled
+                for (uint32_t j = 0; j < targetFramebuffer->colorAttachments.size(); j++) {
+                    MTL::RenderPipelineColorAttachmentDescriptor *pipelineColorAttachment = pipelineDesc->colorAttachments()->object(j);
+                    pipelineColorAttachment->setPixelFormat(targetFramebuffer->colorAttachments[j].getTexture()->pixelFormat());
+                    pipelineColorAttachment->setWriteMask(MTL::ColorWriteMaskNone);
+                }
+
+                pipelineState = device->getOrCreateClearRenderPipelineState(pipelineDesc, clearDepth, clearStencil);
+                pipelineDesc->release();
             }
-
-            const MTL::RenderPipelineState *pipelineState = device->getOrCreateClearRenderPipelineState(pipelineDesc, clearDepth, clearStencil);
             activeRenderEncoder->setRenderPipelineState(pipelineState);
             if (clearDepth && clearStencil) {
                 activeRenderEncoder->setDepthStencilState(device->clearDepthStencilState);
@@ -2924,7 +2979,6 @@ namespace plume {
             }
 
             setCommonClearState();
-            pipelineDesc->release();
 
             // Generate vertices for each rect
             const uint32_t rectCount = clearRectsCount > 0 ? clearRectsCount : 1;
@@ -4132,6 +4186,13 @@ namespace plume {
 
         depthDescriptor->release();
         stencilDescriptor->release();
+
+        // Partial color clears with a depth attachment: no depth or stencil writes, depth test always.
+        MTL::DepthStencilDescriptor *colorClearDepthDescriptor = MTL::DepthStencilDescriptor::alloc()->init();
+        colorClearDepthDescriptor->setDepthWriteEnabled(false);
+        colorClearDepthDescriptor->setDepthCompareFunction(MTL::CompareFunctionAlways);
+        clearColorDepthState = mtl->newDepthStencilState(colorClearDepthDescriptor);
+        colorClearDepthDescriptor->release();
         clearShaderLibrary->release();
     }
 
@@ -4155,6 +4216,12 @@ namespace plume {
 
         auto [inserted_it, success] = clearRenderPipelineStates.insert(std::make_pair(pipelineKey, clearPipelineState));
         return inserted_it->second;
+    }
+
+    MTL::RenderPipelineState* MetalDevice::findClearRenderPipelineState(uint64_t pipelineKey) {
+        std::lock_guard lock(clearPipelineStateMutex);
+        const auto it = clearRenderPipelineStates.find(pipelineKey);
+        return (it != clearRenderPipelineStates.end()) ? it->second : nullptr;
     }
 
     void MetalDevice::addResource(MTL::Resource *resource, bool addressable) {

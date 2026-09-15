@@ -711,6 +711,8 @@ namespace plume {
         MTL::DepthStencilState *clearDepthState;
         MTL::DepthStencilState *clearStencilState;
         MTL::DepthStencilState *clearDepthStencilState;
+        // Depth attached but not written (partial color clears); created once instead of per clear.
+        MTL::DepthStencilState *clearColorDepthState = nullptr;
 
         std::mutex clearPipelineStateMutex;
         std::unordered_map<uint64_t, MTL::RenderPipelineState *> clearRenderPipelineStates;
@@ -765,6 +767,7 @@ namespace plume {
         void createClearShaderLibrary();
 
         MTL::RenderPipelineState* getOrCreateClearRenderPipelineState(MTL::RenderPipelineDescriptor *pipelineDesc, bool depthWriteEnabled = false, bool stencilWriteEnabled = false);
+        MTL::RenderPipelineState* findClearRenderPipelineState(uint64_t pipelineKey);
 
         void addResource(MTL::Resource *resource, bool addressable = false);
         void removeResource(MTL::Resource *resource, bool addressable = false);
